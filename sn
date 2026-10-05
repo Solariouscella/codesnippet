@@ -1,1 +1,464 @@
-KK
+#!/usr/bin/env bash
+
+set -u
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+PYTHON="/ms/dist/python/PROJ/core/3.10.11-0/bin/python"
+
+# Copy BOTH values exactly from the working push_py.
+SOAP_HOST="sln0-prod"
+SOAP_PORT="REPLACE_WITH_PORT_FROM_PUSH_PY"
+
+DEFAULT_KEYWORD="Regal Asia"
+
+
+# ============================================================
+# INPUT
+# ============================================================
+
+echo
+echo "======================================================================"
+echo "ServiceNow Incident Search"
+echo "======================================================================"
+
+read -r -p "Assignment group                     : " GROUP
+read -r -p "Short description contains [Regal Asia]: " KEYWORD
+read -r -p "Created FROM date [YYYY-MM-DD]       : " DATE_FROM
+read -r -p "Created TILL date [YYYY-MM-DD]       : " DATE_TILL
+
+KEYWORD="${KEYWORD:-$DEFAULT_KEYWORD}"
+
+if [[ -z "$GROUP" ]]; then
+    echo "ERROR: Assignment group cannot be empty."
+    exit 1
+fi
+
+if [[ "$SOAP_PORT" == "REPLACE_WITH_PORT_FROM_PUSH_PY" ]]; then
+    echo
+    echo "ERROR: Set SOAP_PORT to the value used by the working push_py."
+    exit 1
+fi
+
+
+# ============================================================
+# VALIDATE DATE FORMAT
+# ============================================================
+
+if ! [[ "$DATE_FROM" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "ERROR: FROM date must be YYYY-MM-DD."
+    exit 1
+fi
+
+if ! [[ "$DATE_TILL" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "ERROR: TILL date must be YYYY-MM-DD."
+    exit 1
+fi
+
+
+# ============================================================
+# EXPORT INPUT FOR PYTHON TRANSPORT
+# ============================================================
+
+export SN_GROUP="$GROUP"
+export SN_KEYWORD="$KEYWORD"
+export SN_DATE_FROM="$DATE_FROM"
+export SN_DATE_TILL="$DATE_TILL"
+
+export SOAP_HOST
+export SOAP_PORT
+
+
+# ============================================================
+# SERVICE NOW SOAP TRANSPORT
+# ============================================================
+
+"$PYTHON" <<'PY'
+import os
+import sys
+import socket
+import struct
+from datetime import datetime, timedelta
+from xml.sax.saxutils import escape
+
+import xmltodict
+import ms.netkrb
+
+
+BUFFSIZE = 4096
+DATE_FORMAT = "%Y-%m-%d"
+
+group = os.environ["SN_GROUP"]
+keyword = os.environ["SN_KEYWORD"]
+date_from = os.environ["SN_DATE_FROM"]
+date_till = os.environ["SN_DATE_TILL"]
+
+host = os.environ["SOAP_HOST"]
+
+try:
+    port = int(os.environ["SOAP_PORT"])
+except ValueError:
+    print("ERROR: SOAP_PORT must be numeric.")
+    sys.exit(1)
+
+
+# ============================================================
+# DATE VALIDATION
+# ============================================================
+
+try:
+    start = datetime.strptime(date_from, DATE_FORMAT)
+    end = datetime.strptime(date_till, DATE_FORMAT)
+except ValueError:
+    print("ERROR: Invalid date.")
+    sys.exit(1)
+
+if start > end:
+    print("ERROR: FROM date cannot be later than TILL date.")
+    sys.exit(1)
+
+
+# ============================================================
+# CREATE SERVICENOW ENCODED QUERY
+# ============================================================
+
+start_timestamp = start.strftime(
+    "%Y-%m-%d 00:00:00"
+)
+
+# TILL date is inclusive.
+end_timestamp = (
+    end + timedelta(days=1)
+).strftime(
+    "%Y-%m-%d 00:00:00"
+)
+
+encoded_query = (
+    f"assignment_group={group}"
+    f"^short_descriptionLIKE{keyword}"
+    f"^sys_created_on>={start_timestamp}"
+    f"^sys_created_on<{end_timestamp}"
+)
+
+print()
+print("Encoded query:")
+print(encoded_query)
+
+
+# ============================================================
+# CREATE SOAP XML
+# ============================================================
+
+safe_query = escape(encoded_query)
+
+soap_request = f"""<?xml version="1.0" encoding="UTF-8"?>
+<SOAP-Env:Envelope
+    xmlns:SOAP-Env="http://schemas.xmlsoap.org/soap/envelope/">
+    <SOAP-Env:Body>
+        <getRecords xmlns="http://www.service-now.com/ticket">
+            <__use_view>API</__use_view>
+            <__encoded_query>{safe_query}</__encoded_query>
+        </getRecords>
+    </SOAP-Env:Body>
+</SOAP-Env:Envelope>
+"""
+
+
+# ============================================================
+# TCP HELPERS
+# ============================================================
+
+class TCPError(Exception):
+    pass
+
+
+def recv_exact(sock, size):
+
+    chunks = []
+    received = 0
+
+    while received < size:
+
+        chunk = sock.recv(
+            min(BUFFSIZE, size - received)
+        )
+
+        if not chunk:
+            raise TCPError(
+                "Connection closed while receiving SOAP response."
+            )
+
+        chunks.append(chunk)
+        received += len(chunk)
+
+    return b"".join(chunks)
+
+
+# ============================================================
+# CONNECT
+# ============================================================
+
+sock = socket.socket(
+    socket.AF_INET,
+    socket.SOCK_STREAM
+)
+
+try:
+
+    print()
+    print(f"Connecting to {host}:{port} ...")
+
+    sock.connect(
+        (host, port)
+    )
+
+    # --------------------------------------------------------
+    # Kerberos authentication
+    # --------------------------------------------------------
+
+    ms.netkrb.NetKrb.authenticate_client(
+        sock=sock,
+        role="Client",
+        mechlist=["Kerberos"]
+    )
+
+    print("Kerberos authentication successful.")
+
+
+    # ========================================================
+    # SEND SOAP REQUEST
+    # ========================================================
+
+    payload = soap_request.encode("utf-8")
+
+    # Internal protocol:
+    #
+    #   4-byte big-endian message length
+    #               +
+    #           SOAP XML
+    #
+
+    message = (
+        struct.pack(">I", len(payload))
+        + payload
+    )
+
+    sock.sendall(message)
+
+    print("SOAP request sent.")
+
+
+    # ========================================================
+    # RECEIVE SOAP RESPONSE
+    # ========================================================
+
+    response_parts = []
+
+    while True:
+
+        header = recv_exact(sock, 4)
+
+        size = struct.unpack(
+            ">I",
+            header
+        )[0]
+
+        # High bit means another block follows.
+        continue_flag = bool(
+            size & 0x80000000
+        )
+
+        size &= 0x7fffffff
+
+        block = recv_exact(
+            sock,
+            size
+        )
+
+        response_parts.append(block)
+
+        if not continue_flag:
+            break
+
+
+    response = b"".join(
+        response_parts
+    ).decode(
+        "utf-8",
+        errors="replace"
+    )
+
+
+finally:
+
+    sock.close()
+
+
+# ============================================================
+# PARSE XML
+# ============================================================
+
+try:
+    data = xmltodict.parse(response)
+except Exception as exc:
+    print()
+    print("ERROR: Unable to parse SOAP response:")
+    print(exc)
+
+    print()
+    print("Raw response:")
+    print(response)
+
+    sys.exit(1)
+
+
+# ============================================================
+# LOCATE SOAP BODY
+# ============================================================
+
+envelope = (
+    data.get("soap:Envelope")
+    or data.get("SOAP-Env:Envelope")
+    or data.get("SOAP-ENV:Envelope")
+    or {}
+)
+
+body = (
+    envelope.get("soap:Body")
+    or envelope.get("SOAP-Env:Body")
+    or envelope.get("SOAP-ENV:Body")
+    or {}
+)
+
+
+# ============================================================
+# CHECK SOAP FAULT
+# ============================================================
+
+fault = (
+    body.get("soap:Fault")
+    or body.get("SOAP-Env:Fault")
+    or body.get("SOAP-ENV:Fault")
+)
+
+if fault:
+
+    print()
+    print("SOAP FAULT:")
+    print(fault)
+
+    sys.exit(1)
+
+
+# ============================================================
+# GET RECORDS
+# ============================================================
+
+response_data = (
+    body.get("getRecordsResponse")
+    or {}
+)
+
+records = response_data.get(
+    "getRecordsResult",
+    []
+)
+
+if not records:
+
+    print()
+    print("No matching incidents found.")
+    print("Total incidents: 0")
+
+    sys.exit(0)
+
+
+if isinstance(records, dict):
+    records = [records]
+
+
+# ============================================================
+# SECOND CASE-INSENSITIVE CHECK
+# ============================================================
+
+keyword_lower = keyword.lower()
+
+incidents = []
+
+for record in records:
+
+    short_description = (
+        record.get("short_description")
+        or ""
+    )
+
+    if keyword_lower not in short_description.lower():
+        continue
+
+    incidents.append(
+        {
+            "number":
+                record.get("number", ""),
+
+            "created":
+                record.get(
+                    "sys_created_on",
+                    ""
+                ),
+
+            "short_description":
+                short_description,
+
+            "problem":
+                record.get(
+                    "problem_id",
+                    ""
+                ),
+        }
+    )
+
+
+# ============================================================
+# DISPLAY RESULTS
+# ============================================================
+
+print()
+print("=" * 120)
+
+print(
+    f"{'Incident':<18}"
+    f"{'Created':<22}"
+    f"{'Problem':<18}"
+    f"{'Short Description'}"
+)
+
+print("=" * 120)
+
+
+for incident in incidents:
+
+    print(
+        f"{incident['number']:<18}"
+        f"{incident['created']:<22}"
+        f"{incident['problem']:<18}"
+        f"{incident['short_description']}"
+    )
+
+
+print("=" * 120)
+
+print(
+    f"Total incidents: {len(incidents)}"
+)
+
+PY
+
+RC=$?
+
+if [[ $RC -ne 0 ]]; then
+    echo
+    echo "ServiceNow query failed."
+    exit "$RC"
+fi
