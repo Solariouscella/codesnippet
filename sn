@@ -1,6 +1,38 @@
 
     
   
+#!/usr/bin/env bash
+# Remove the entire "Legal Party ID" pipe-delimited column from a file.
+# Usage: bash paash INPUT_FILE [OUTPUT_FILE]
+set -euo pipefail
+umask 077
+
+if (( $# < 1 || $# > 2 )); then
+    printf 'Usage: bash %s INPUT_FILE [OUTPUT_FILE]\n' "$0" >&2
+    exit 64
+fi
+
+input=$1
+output=${2:-"${input}.without_legal_party_id"}
+
+# Support filenames that begin with a dash.
+case $input in -*) input="./$input" ;; esac
+case $output in -*) output="./$output" ;; esac
+
+if [[ ! -f $input || ! -r $input ]]; then
+    printf 'ERROR: Input file is missing or unreadable: %s\n' "$input" >&2
+    exit 1
+fi
+if [[ $input == "$output" || $input -ef $output ]]; then
+    printf 'ERROR: Input and output must be different files.\n' >&2
+    exit 1
+fi
+if [[ -e $output || -L $output ]]; then
+    printf 'ERROR: Output already exists: %s\n' "$output" >&2
+    exit 1
+fi
+
+# Write to a temporary file first; delete it if AWK encounters an error.
 tmp=$(mktemp "${output}.tmp.XXXXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
 
