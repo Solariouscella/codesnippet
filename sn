@@ -1,84 +1,132 @@
-#!/bin/bash
 
-select_option() {
-    local options=("$@")
-    local selected=0
-    local key
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
 
-    while true; do
-        clear
-        for i in "${!options[@]}"; do
-            if [[ $i -eq $selected ]]; then
-                echo "> ${options[$i]}"
-            else
-                echo "  ${options[$i]}"
-            fi
-        done
+# Usage: ./remove_legal_party_id.sh INPUT [OUTPUT]
 
-        read -rsn1 key
-        if [[ $key == "" ]]; then
-            break
-        elif [[ $key == "k" ]]; then
-            ((selected--))
-            [[ $selected -lt 0 ]] && selected=$((${#options[@]}-1))
-        elif [[ $key == "j" ]]; then
-            ((selected++))
-            [[ $selected -ge ${#options[@]} ]] && selected=0
-        elif [[ $key == $'\x1b' ]]; then
-            read -rsn2 key
-            if [[ $key == "[A" ]]; then
-                ((selected--))
-                [[ $selected -lt 0 ]] && selected=$((${#options[@]}-1))
-            elif [[ $key == "[B" ]]; then
-                ((selected++))
-                [[ $selected -ge ${#options[@]} ]] && selected=0
-            fi
-        fi
-    done
-    echo "${options[$selected]}"
+if (( $# < 1 || $# > 2 )); then
+    printf 'Usage: %s INPUT [OUTPUT]\n' "$0" >&2
+    exit 64
+fi
+
+input=$1
+output=${2:-"${input}.without_legal_party_id"}
+
+# Handle filenames beginning with a dash.
+case $input in -*) input="./$input" ;; esac
+case $output in -*) output="./$output" ;; esac
+
+# Validate input.
+if [[ ! -f $input || ! -r $input ]]; then
+    echo "ERROR: Input is not a readable file: $input" >&2
+    exit 1
+fi
+
+# Never overwrite an existing output.
+if [[ $input == "$output" ]]; then
+    echo "ERROR: Input and output must differ" >&2
+    exit 1
+fi
+
+if [[ -e $output || -L $output ]]; then
+    echo "ERROR: Output already exists: $output" >&2
+    exit 1
+fi
+
+# Work in a temporary file first.
+tmp=$(mktemp "${output}.tmp.XXXXXXXX")
+trap 'rm -f -- "$tmp"' EXIT
+
+LC_ALL=C awk -F '|' -v target='Legal Party ID' '
+
+function fail(message) {
+    printf "ERROR at record %d: %s\n", NR, message \
+        > "/dev/stderr"
+    exit 2
 }
 
-echo "=== EZSSH Wrapper ==="
-read -p "Hostname (or 'exit'): " HOSTNAME
-[[ "$HOSTNAME" == "exit" ]] && exit 0
+{
+    # Preserve original LF/CRLF line endings.
+    cr = ""
+    if (sub(/\r$/, "", $0))
+        cr = "\r"
 
-read -p "Impersonate user (or 'exit'): " IMPUSER
-[[ "$IMPUSER" == "exit" ]] && exit 0
+    # STEP 1: Identify the target column.
+    if (NR == 1) {
+        expected_fields = NF
+        line_ending = cr
+        matches = 0
 
-read -p "Ticket number -T (or 'exit'): " TICKET
-[[ "$TICKET" == "exit" ]] && exit 0
+        for (i = 1; i <= NF; i++) {
+            if ($i == target) {
+                column = i
+                matches++
+            }
+        }
 
-while true; do
-    echo ""
-    echo "Run a command or a script? (j/k or arrows, Enter to select)"
-    TYPE=$(select_option "command" "script" "exit")
-    [[ "$TYPE" == "exit" ]] && break
+        if (matches != 1)
+            fail("Expected exactly one Legal Party ID column")
 
-    if [[ "$TYPE" == "command" ]]; then
-        read -p "Enter command (or 'exit'): " CMD
-        [[ "$CMD" == "exit" ]] && break
-        OFLAG="$CMD"
-    else
-        read -p "Enter script path (or 'exit'): " SCRIPTPATH
-        [[ "$SCRIPTPATH" == "exit" ]] && break
-        OFLAG="script $SCRIPTPATH"
-    fi
+        if (NF < 2)
+            fail("Cannot remove the only column")
+    }
+    else if (cr != line_ending) {
+        fail("Mixed LF and CRLF line endings")
+    }
 
-    FULL_CMD="ezssh $HOSTNAME $IMPUSER/cmd exec -T $TICKET -O \"$OFLAG\""
+    # STEP 2: Validate field count on every record.
+    if (NF != expected_fields)
+        fail(sprintf(
+            "Expected %d fields, found %d",
+            expected_fields, NF
+        ))
 
-    echo ""
-    echo "---- Dry run preview ----"
-    echo "$FULL_CMD"
-    echo "--------------------------"
+    # STEP 3: Calculate the target field position.
+    start = 1
 
-    echo "Run this now?"
-    CONFIRM=$(select_option "yes" "no")
-    [[ "$CONFIRM" == "yes" ]] && eval "$FULL_CMD"
+    for (i = 1; i < column; i++)
+        start += length($i) + 1
 
-    echo ""
-    echo "Run another?"
-    AGAIN=$(select_option "yes" "no" "exit")
-    [[ "$AGAIN" != "yes" ]] && break
-done
+    # STEP 4: Remove the column.
+    if (column < NF) {
 
-echo "Done."
+        # Keep everything before the target.
+        left = substr($0, 1, start - 1)
+
+        # Skip the target and its following pipe.
+        right = substr(
+            $0,
+            start + length($(column)) + 1
+        )
+    }
+    else {
+        # Final column: remove preceding pipe.
+        left = substr($0, 1, start - 2)
+        right = ""
+    }
+
+    # STEP 5: Write the reconstructed record.
+    printf "%s%s%s\n", left, right, cr
+}
+
+END {
+    if (NR == 0) {
+        print "ERROR: Input file is empty" > "/dev/stderr"
+        exit 2
+    }
+}
+
+' "$input" > "$tmp"
+
+# Publish only after successful processing.
+# Hard-link creation is atomic and does not overwrite.
+if ! ln -- "$tmp" "$output"; then
+    echo "ERROR: Could not safely publish $output" >&2
+    exit 1
+fi
+
+rm -- "$tmp"
+trap - EXIT
+
+printf 'Success: %s -> %s\n' "$input" "$output"
