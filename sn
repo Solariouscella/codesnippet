@@ -1,128 +1,77 @@
 
-#!/usr/bin/env bash
-set -euo pipefail
-umask 077
-
-# Usage: bash paash INPUT [OUTPUT]
-
-if (( $# < 1 || $# > 2 )); then
-    echo "Usage: bash paash INPUT [OUTPUT]" >&2
-    exit 64
-fi
-
-input=$1
-output=${2:-"${input}.without_legal_party_id"}
-
-case $input in -*) input="./$input" ;; esac
-case $output in -*) output="./$output" ;; esac
-
-if [[ ! -f $input || ! -r $input ]]; then
-    echo "ERROR: Input file missing or unreadable" >&2
-    exit 1
-fi
-
-if [[ $input == "$output" || $input -ef $output ]]; then
-    echo "ERROR: Input and output must differ" >&2
-    exit 1
-fi
-
-if [[ -e $output || -L $output ]]; then
-    echo "ERROR: Output already exists: $output" >&2
-    exit 1
-fi
-
-# Use temporary output to prevent partial results.
+    
+  
 tmp=$(mktemp "${output}.tmp.XXXXXXXX")
 trap 'rm -f -- "$tmp"' EXIT
 
 LC_ALL=C awk -F '[|]' '
-
 function fail(message) {
-    printf "ERROR at line %d: %s\n", NR, message \
-        > "/dev/stderr"
+    printf "ERROR at line %d: %s\n", NR, message > "/dev/stderr"
     exit 2
 }
-
 {
-    # Preserve LF or CRLF line endings.
+    # Preserve the input line-ending style (LF or CRLF).
     cr = ""
-    if (sub(/\r$/, "", $0))
-        cr = "\r"
+    if (sub(/\r$/, "", $0)) cr = "\r"
 
-    # Find Legal Party ID using header.
     if (NR == 1) {
         expected_fields = NF
         first_cr = cr
         matches = 0
 
+        # Find the column by its header rather than hard-coding 86.
         for (i = 1; i <= NF; i++) {
             if ($i == "Legal Party ID") {
                 column = i
                 matches++
             }
         }
-
         if (matches != 1)
             fail("Expected exactly one Legal Party ID header")
-
         if (NF < 2)
             fail("Cannot remove the only column")
-    }
-    else if (cr != first_cr) {
-        fail("Mixed line endings")
+    } else if (cr != first_cr) {
+        fail("Mixed LF and CRLF line endings")
     }
 
-    # Validate every record.
+    # Refuse malformed records: their field indexes could be shifted.
     if (NF != expected_fields)
-        fail(sprintf(
-            "Expected %d fields, found %d",
-            expected_fields, NF
-        ))
+        fail(sprintf("Expected %d fields, found %d", expected_fields, NF))
 
-    # Find the starting character of target column.
+    # Locate the target field in the ORIGINAL text of this record.
     start = 1
-
     for (i = 1; i < column; i++)
         start += length($i) + 1
 
-    # Remove column and surrounding pipes.
     if (column == 1) {
-        result = substr(
-            $0,
-            start + length($(column)) + 1
-        )
-    }
-    else if (column == NF) {
+        # First column: remove its value and the following pipe.
+        result = substr($0, start + length($(column)) + 1)
+    } else if (column == NF) {
+        # Last column: remove the preceding pipe and its value.
         result = substr($0, 1, start - 2)
-    }
-    else {
+    } else {
+        # Middle column: remove its value and BOTH surrounding pipes,
+        # then insert ONE pipe between the two surviving neighbors.
         result = substr($0, 1, start - 2) "|" \
-                 substr(
-                     $0,
-                     start + length($(column)) + 1
-                 )
+                 substr($0, start + length($(column)) + 1)
     }
-
-    # Write corrected record.
     printf "%s%s\n", result, cr
 }
-
 END {
     if (NR == 0) {
-        print "ERROR: Empty input file" > "/dev/stderr"
+        print "ERROR: Input file is empty" > "/dev/stderr"
         exit 2
     }
 }
-
 ' "$input" > "$tmp"
 
-# Publish only after successful processing.
+# Publish only after AWK succeeds. Hard-link creation does not overwrite.
+# The temp file is in the same directory as the final output.
 if ! ln -- "$tmp" "$output"; then
-    echo "ERROR: Failed to publish output" >&2
+    printf 'ERROR: Could not publish output (existing file or hard-link restriction): %s\n' "$output" >&2
     exit 1
 fi
-
 rm -f -- "$tmp"
 trap - EXIT
-
 printf 'Success: %s -> %s\n' "$input" "$output"
+
