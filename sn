@@ -1,109 +1,75 @@
-
-    
-  
 #!/usr/bin/env bash
-# Remove the entire "Legal Party ID" pipe-delimited column from a file.
-# Usage: bash paash INPUT_FILE [OUTPUT_FILE]
-set -euo pipefail
-umask 077
+# Verify that a cleaned pipe-delimited feed differs from the original
+# ONLY by removal of its "Legal Party ID" column.
+# Requires: bash, awk, GNU cut, cmp
 
-if (( $# < 1 || $# > 2 )); then
-    printf 'Usage: bash %s INPUT_FILE [OUTPUT_FILE]\n' "$0" >&2
-    exit 64
-fi
+verify_legal_party_id_removed() {
+    if (( $# != 2 )); then
+        printf 'Usage: verify_legal_party_id_removed ORIGINAL CLEANED\n' >&2
+        return 2
+    fi
 
-input=$1
-output=${2:-"${input}.without_legal_party_id"}
+    local original=$1 cleaned=$2 column
+    case $original in -*) original="./$original" ;; esac
+    case $cleaned in -*) cleaned="./$cleaned" ;; esac
 
-# Support filenames that begin with a dash.
-case $input in -*) input="./$input" ;; esac
-case $output in -*) output="./$output" ;; esac
+    if [[ ! -f $original || ! -r $original || ! -f $cleaned || ! -r $cleaned ]]; then
+        printf 'FAIL: Both files must exist and be readable.\n' >&2
+        return 2
+    fi
 
-if [[ ! -f $input || ! -r $input ]]; then
-    printf 'ERROR: Input file is missing or unreadable: %s\n' "$input" >&2
-    exit 1
-fi
-if [[ $input == "$output" || $input -ef $output ]]; then
-    printf 'ERROR: Input and output must be different files.\n' >&2
-    exit 1
-fi
-if [[ -e $output || -L $output ]]; then
-    printf 'ERROR: Output already exists: %s\n' "$output" >&2
-    exit 1
-fi
-
-# Write to a temporary file first; delete it if AWK encounters an error.
-tmp=$(mktemp "${output}.tmp.XXXXXXXX")
-trap 'rm -f -- "$tmp"' EXIT
-
-LC_ALL=C awk -F '[|]' '
-function fail(message) {
-    printf "ERROR at line %d: %s\n", NR, message > "/dev/stderr"
-    exit 2
-}
-{
-    # Preserve the input line-ending style (LF or CRLF).
-    cr = ""
-    if (sub(/\r$/, "", $0)) cr = "\r"
-
-    if (NR == 1) {
-        expected_fields = NF
-        first_cr = cr
-        matches = 0
-
-        # Find the column by its header rather than hard-coding 86.
-        for (i = 1; i <= NF; i++) {
-            if ($i == "Legal Party ID") {
-                column = i
-                matches++
+    # Detect the target column from the original header (not a hard-coded index).
+    column=$(LC_ALL=C awk -F '[|]' '
+        NR == 1 {
+            hits = 0
+            for (i = 1; i <= NF; i++) {
+                header = $i
+                sub(/\r$/, "", header)
+                if (header == "Legal Party ID") { hits++; position = i }
+            }
+            if (hits != 1) {
+                print "FAIL: Expected exactly one Legal Party ID header" > "/dev/stderr"
+                exit 1
+            }
+            if (NF < 2) {
+                print "FAIL: Cannot remove the only column" > "/dev/stderr"
+                exit 1
+            }
+            print position
+            exit
+        }
+        END {
+            if (NR == 0) {
+                print "FAIL: Original feed is empty" > "/dev/stderr"
+                exit 1
             }
         }
-        if (matches != 1)
-            fail("Expected exactly one Legal Party ID header")
-        if (NF < 2)
-            fail("Cannot remove the only column")
-    } else if (cr != first_cr) {
-        fail("Mixed LF and CRLF line endings")
-    }
+    ' "$original") || return 1
 
-    # Refuse malformed records: their field indexes could be shifted.
-    if (NF != expected_fields)
-        fail(sprintf("Expected %d fields, found %d", expected_fields, NF))
+    # Reject inconsistent records before comparing; cut alone will not detect them.
+    LC_ALL=C awk -F '[|]' '
+        NR == 1 { expected = NF }
+        NF != expected {
+            printf "FAIL: Original record %d has %d fields (expected %d)\n", NR, NF, expected > "/dev/stderr"
+            bad = 1
+            exit 1
+        }
+        END { if (bad) exit 1 }
+    ' "$original" || return 1
 
-    # Locate the target field in the ORIGINAL text of this record.
-    start = 1
-    for (i = 1; i < column; i++)
-        start += length($i) + 1
-
-    if (column == 1) {
-        # First column: remove its value and the following pipe.
-        result = substr($0, start + length($(column)) + 1)
-    } else if (column == NF) {
-        # Last column: remove the preceding pipe and its value.
-        result = substr($0, 1, start - 2)
-    } else {
-        # Middle column: remove its value and BOTH surrounding pipes,
-        # then insert ONE pipe between the two surviving neighbors.
-        result = substr($0, 1, start - 2) "|" \
-                 substr($0, start + length($(column)) + 1)
-    }
-    printf "%s%s\n", result, cr
+    # Independent byte-for-byte comparison of expected result against cleaned feed.
+    # Subshell enables pipefail even if this function is sourced from another script.
+    if ( set -o pipefail; LC_ALL=C cut -d '|' --complement -f "$column" -- "$original" | cmp -s -- - "$cleaned" ); then
+        printf 'PASS: Only Legal Party ID (column %s) was removed.\n' "$column"
+        printf 'PASS: All other values, separators, records and ordering match exactly.\n'
+    else
+        printf 'FAIL: Cleaned file differs beyond removing Legal Party ID (column %s).\n' "$column" >&2
+        return 1
+    fi
 }
-END {
-    if (NR == 0) {
-        print "ERROR: Input file is empty" > "/dev/stderr"
-        exit 2
-    }
-}
-' "$input" > "$tmp"
 
-# Publish only after AWK succeeds. Hard-link creation does not overwrite.
-# The temp file is in the same directory as the final output.
-if ! ln -- "$tmp" "$output"; then
-    printf 'ERROR: Could not publish output (existing file or hard-link restriction): %s\n' "$output" >&2
-    exit 1
+# Run as a command, or source it to use the function in another script.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    verify_legal_party_id_removed "$@"
 fi
-rm -f -- "$tmp"
-trap - EXIT
-printf 'Success: %s -> %s\n' "$input" "$output"
 
